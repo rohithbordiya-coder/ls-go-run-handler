@@ -125,17 +125,24 @@ func BenchmarkGetRun(b *testing.B) {
 
 	cases := []struct {
 		name      string
+		batch     int
 		fieldSize int
+		// position controls which run in the batch we GET: "first", "middle", or "last".
+		// Streaming decode exits early — first is cheapest, last is worst-case.
+		position string
 	}{
-		{name: "100KB_fields", fieldSize: 100},
-		{name: "1000KB_fields", fieldSize: 1000},
+		{name: "batch1_100KB", batch: 1, fieldSize: 100, position: "first"},
+		{name: "batch1_1000KB", batch: 1, fieldSize: 1000, position: "first"},
+		{name: "batch500_100KB_first", batch: 500, fieldSize: 100, position: "first"},
+		{name: "batch500_100KB_middle", batch: 500, fieldSize: 100, position: "middle"},
+		{name: "batch500_100KB_last", batch: 500, fieldSize: 100, position: "last"},
 	}
 
 	for _, tc := range cases {
 		tc := tc
 		b.Run(tc.name, func(b *testing.B) {
-			// Seed one run to fetch — outside the timed loop.
-			body := makeRunsBody(1, tc.fieldSize)
+			// Seed the batch outside the timed loop.
+			body := makeRunsBody(tc.batch, tc.fieldSize)
 			resp, err := client.Post(ts.URL+"/runs", "application/json", bytes.NewReader(body))
 			if err != nil || resp.StatusCode != http.StatusCreated {
 				b.Fatalf("seed POST failed: status=%d err=%v", resp.StatusCode, err)
@@ -148,7 +155,17 @@ func BenchmarkGetRun(b *testing.B) {
 			if len(created.RunIDs) == 0 {
 				b.Fatal("no run_ids in POST response")
 			}
-			getURL := ts.URL + "/runs/" + created.RunIDs[0]
+
+			var targetID string
+			switch tc.position {
+			case "first":
+				targetID = created.RunIDs[0]
+			case "middle":
+				targetID = created.RunIDs[len(created.RunIDs)/2]
+			case "last":
+				targetID = created.RunIDs[len(created.RunIDs)-1]
+			}
+			getURL := ts.URL + "/runs/" + targetID
 
 			b.ReportAllocs()
 			b.ResetTimer()
