@@ -179,3 +179,16 @@ With `json.RawMessage`, both steps collapse to a single byte copy. A 1000KB fiel
 | Allocs | 20,857 → 2,321 (**99% fewer**) | 186,944 → 2,341 (**99% fewer**) |
 
 Allocations drop 99% — from scaling with field content size to a flat ~2300 regardless of payload size. Memory halves. The remaining latency is S3 network I/O.
+
+
+### Extra Improvement (more thoughts)
+
+1.  Enable compression for upload; Researched how Datadog, langfuse and Splunk does?
+2.  Did look at NDJSON and ProtoBuf either of them can make case with multipart upload.
+3.  Streaming using Nats.io
+    NATS JetStream (stream: TRACES)                                                                              
+    │                                                                                                          
+    ├─► Consumer 1: batch → zstd compress → multipart S3 PUT                                                   
+    ├─► Consumer 2: extract metadata → write to Postgres/DynamoDB                                              
+
+    
