@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -19,34 +21,28 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	appconfig "github.com/langchain-ai/ls-go-run-handler/internal/config"
 )
 
 // RunIn represents input payload for a run.
+// Inputs/Outputs/Metadata are json.RawMessage so the decoder captures their bytes verbatim —
+// no map[string]any allocation, no re-serialization on the write path.
 type RunIn struct {
-	ID       *string        `json:"id,omitempty"`
-	TraceID  string         `json:"trace_id"`
-	Name     string         `json:"name"`
-	Inputs   map[string]any `json:"inputs"`
-	Outputs  map[string]any `json:"outputs"`
-	Metadata map[string]any `json:"metadata"`
-}
-
-// runJSON is used to produce stable JSON for batch upload while tracking offsets.
-type runJSON struct {
-	ID       uuid.UUID       `json:"id"`
-	TraceID  uuid.UUID       `json:"trace_id"`
+	ID       *string         `json:"id,omitempty"`
+	TraceID  string          `json:"trace_id"`
 	Name     string          `json:"name"`
 	Inputs   json.RawMessage `json:"inputs"`
 	Outputs  json.RawMessage `json:"outputs"`
 	Metadata json.RawMessage `json:"metadata"`
 }
 
+
 type Server struct {
-	cfg appconfig.Settings
-	dsn string
-	s3  *s3.Client
+	cfg  appconfig.Settings
+	pool *pgxpool.Pool
+	s3   *s3.Client
 }
 
 func main() {
@@ -55,8 +51,13 @@ func main() {
 	// Load settings
 	settings := appconfig.Load()
 
-	// Build DSN for Postgres
+	// Build connection pool — shared across all requests, eliminates per-request TCP handshakes.
 	dsn := fmt.Sprintf("postgres://%s:%s@%s:%s/%s", settings.DBUser, settings.DBPassword, settings.DBHost, settings.DBPort, settings.DBName)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		log.Fatalf("failed to create connection pool: %v", err)
+	}
+	defer pool.Close()
 
 	// Init S3 client (communicate to MinIO locally)
 	awsCfg, err := awsconfig.LoadDefaultConfig(
@@ -72,7 +73,7 @@ func main() {
 		o.BaseEndpoint = aws.String(settings.S3Endpoint)
 	})
 
-	srv := &Server{cfg: settings, dsn: dsn, s3: s3Client}
+	srv := &Server{cfg: settings, pool: pool, s3: s3Client}
 
 	r := chi.NewRouter()
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -150,40 +151,46 @@ func (s *Server) createRunsHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Marshal nested fields first to preserve bytes
-		inputsBytes, _ := json.Marshal(in.Inputs)
-		outputsBytes, _ := json.Marshal(in.Outputs)
-		metadataBytes, _ := json.Marshal(in.Metadata)
-		rj := runJSON{ID: id, TraceID: traceID, Name: in.Name, Inputs: inputsBytes, Outputs: outputsBytes, Metadata: metadataBytes}
-		runBytes, err := json.Marshal(rj)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to encode run"})
-			return
-		}
+		// Build run JSON directly into the batch buffer, recording byte offsets as we go.
+		// Eliminates: 3× json.Marshal for large fields, 1× json.Marshal for the whole struct,
+		// and 3× bytes.Index searches through the marshaled bytes.
+		idJSON, _ := json.Marshal(id.String())
+		traceJSON, _ := json.Marshal(traceID.String())
+		nameJSON, _ := json.Marshal(in.Name)
+
 		if i > 0 {
 			buf.WriteByte(',')
 		}
-		runStart := buf.Len()
-		buf.Write(runBytes)
+		buf.WriteString(`{"id":`)
+		buf.Write(idJSON)
+		buf.WriteString(`,"trace_id":`)
+		buf.Write(traceJSON)
+		buf.WriteString(`,"name":`)
+		buf.Write(nameJSON)
+		buf.WriteString(`,"inputs":`)
+		inputsStart := buf.Len()
+		buf.Write(in.Inputs)
+		inputsEnd := buf.Len()
+		buf.WriteString(`,"outputs":`)
+		outputsStart := buf.Len()
+		buf.Write(in.Outputs)
+		outputsEnd := buf.Len()
+		buf.WriteString(`,"metadata":`)
+		metadataStart := buf.Len()
+		buf.Write(in.Metadata)
+		metadataEnd := buf.Len()
+		buf.WriteByte('}')
 
-		mkRef := func(field string, fieldBytes []byte) string {
-			idx := bytes.Index(runBytes, fieldBytes)
-			if idx == -1 {
-				return ""
-			}
-			start := runStart + idx
-			end := start + len(fieldBytes)
+		mkRef := func(field string, start, end int) string {
 			return fmt.Sprintf("s3://%s/%s#%d:%d/%s", s.cfg.S3BucketName, objectKey, start, end, field)
 		}
-
 		offs = append(offs, runOffsets{
 			id:          id,
 			traceID:     traceID,
 			name:        in.Name,
-			inputsRef:   mkRef("inputs", inputsBytes),
-			outputsRef:  mkRef("outputs", outputsBytes),
-			metadataRef: mkRef("metadata", metadataBytes),
+			inputsRef:   mkRef("inputs", inputsStart, inputsEnd),
+			outputsRef:  mkRef("outputs", outputsStart, outputsEnd),
+			metadataRef: mkRef("metadata", metadataStart, metadataEnd),
 		})
 	}
 	buf.WriteByte(']')
@@ -203,25 +210,32 @@ func (s *Server) createRunsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Insert references into Postgres
-	conn, err := pgx.Connect(ctx, s.dsn)
+	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
-		log.Printf("db connect error: %v", err)
+		log.Printf("db acquire error: %v", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to connect to database"})
 		return
 	}
-	defer conn.Close(ctx)
+	defer conn.Release()
 
-	runIDs := make([]string, 0, len(offs))
+	// Queue all inserts into a single batch — one round-trip to Postgres instead of N.
+	batch := &pgx.Batch{}
 	for _, ro := range offs {
-		var outID uuid.UUID
-		err := conn.QueryRow(ctx,
+		batch.Queue(
 			`INSERT INTO runs (id, trace_id, name, inputs, outputs, metadata)
              VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id`,
 			ro.id, ro.traceID, ro.name, ro.inputsRef, ro.outputsRef, ro.metadataRef,
-		).Scan(&outID)
-		if err != nil {
+		)
+	}
+	br := conn.SendBatch(ctx, batch)
+	defer br.Close()
+
+	runIDs := make([]string, 0, len(offs))
+	for range offs {
+		var outID uuid.UUID
+		if err := br.QueryRow().Scan(&outID); err != nil {
 			log.Printf("db insert error: %v", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to insert runs"})
@@ -255,13 +269,13 @@ func (s *Server) getRunHandler(w http.ResponseWriter, r *http.Request) {
 		outputsRef  string
 		metadataRef string
 	)
-	conn, err := pgx.Connect(ctx, s.dsn)
+	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to connect to database"})
 		return
 	}
-	defer conn.Close(ctx)
+	defer conn.Release()
 	err = conn.QueryRow(ctx,
 		`SELECT id, trace_id, name, COALESCE(inputs, ''), COALESCE(outputs, ''), COALESCE(metadata, '')
          FROM runs WHERE id = $1`, id,
@@ -273,9 +287,19 @@ func (s *Server) getRunHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inputs := s.fetchFromS3(ctx, inputsRef)
-	outputs := s.fetchFromS3(ctx, outputsRef)
-	metadata := s.fetchFromS3(ctx, metadataRef)
+	// Fetch all three fields in parallel.
+	// errgroup.WithContext cancels gctx if any fetch errors, stopping the other two mid-flight.
+	var inputs, outputs, metadata json.RawMessage
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { var err error; inputs, err = s.fetchFromS3(gctx, inputsRef); return err })
+	g.Go(func() error { var err error; outputs, err = s.fetchFromS3(gctx, outputsRef); return err })
+	g.Go(func() error { var err error; metadata, err = s.fetchFromS3(gctx, metadataRef); return err })
+	if err := g.Wait(); err != nil {
+		log.Printf("s3 fetch error: %v", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "failed to fetch run data from storage"})
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -321,11 +345,13 @@ func (s *Server) parseS3Ref(ref string) (bucket, key string, start, end int, ok 
 	return
 }
 
-// fetchFromS3 retrieves the JSON fragment using byte range, returns empty object on errors.
-func (s *Server) fetchFromS3(ctx context.Context, ref string) map[string]any {
+// fetchFromS3 retrieves the JSON fragment using byte range.
+// Returns json.RawMessage so the caller can embed the bytes directly into the response
+// without an extra unmarshal+remarshal cycle through map[string]any.
+func (s *Server) fetchFromS3(ctx context.Context, ref string) (json.RawMessage, error) {
 	bucket, key, start, end, ok := s.parseS3Ref(ref)
 	if !ok || bucket == "" || key == "" || end <= start {
-		return map[string]any{}
+		return json.RawMessage(`{}`), nil
 	}
 	rng := fmt.Sprintf("bytes=%d-%d", start, end-1)
 	out, err := s.s3.GetObject(ctx, &s3.GetObjectInput{
@@ -334,17 +360,12 @@ func (s *Server) fetchFromS3(ctx context.Context, ref string) map[string]any {
 		Range:  aws.String(rng),
 	})
 	if err != nil {
-		log.Printf("s3 GetObject error: %v", err)
-		return map[string]any{}
+		return nil, fmt.Errorf("s3 GetObject: %w", err)
 	}
 	defer out.Body.Close()
 	b, err := io.ReadAll(out.Body)
 	if err != nil {
-		return map[string]any{}
+		return nil, fmt.Errorf("read s3 body: %w", err)
 	}
-	var v map[string]any
-	if err := json.Unmarshal(b, &v); err != nil {
-		return map[string]any{}
-	}
-	return v
+	return json.RawMessage(b), nil
 }

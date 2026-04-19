@@ -19,5 +19,8 @@ services:
       MINIO_ROOT_USER: minioadmin1
       MINIO_ROOT_PASSWORD: minioadmin1
     volumes:
-      - ./.data/minio:/data
+      - minio_data:/data
     restart: always
+
+volumes:
+  minio_data:
