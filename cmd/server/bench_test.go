@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	appconfig "github.com/langchain-ai/ls-go-run-handler/internal/config"
 )
 
 const (
@@ -58,6 +63,108 @@ func makeRunsBody(batch, sizeKB int) []byte {
 	}
 	b, _ := json.Marshal(runs)
 	return b
+}
+
+// BenchmarkDBConnection compares the cost of acquiring a DB connection two ways:
+//   - direct: pgx.Connect() — full TCP handshake + Postgres auth on every call
+//   - pooled: pgxpool.Acquire() — returns an already-open connection in microseconds
+//
+// Run with -benchtime=5s and -cpu=8 to stress concurrent acquisition.
+func BenchmarkDBConnection(b *testing.B) {
+	cfg := appconfig.Load()
+	dsn := "postgres://" + cfg.DBUser + ":" + cfg.DBPassword + "@" + cfg.DBHost + ":" + cfg.DBPort + "/" + cfg.DBName
+
+	b.Run("direct_pgx_Connect", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				conn, err := pgx.Connect(context.Background(), dsn)
+				if err != nil {
+					b.Errorf("connect failed: %v", err)
+					return
+				}
+				var n int
+				_ = conn.QueryRow(context.Background(), "SELECT 1").Scan(&n)
+				conn.Close(context.Background())
+			}
+		})
+	})
+
+	b.Run("pooled_pgxpool_Acquire", func(b *testing.B) {
+		pool, err := pgxpool.New(context.Background(), dsn)
+		if err != nil {
+			b.Fatalf("failed to create pool: %v", err)
+		}
+		defer pool.Close()
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				conn, err := pool.Acquire(context.Background())
+				if err != nil {
+					b.Errorf("acquire failed: %v", err)
+					return
+				}
+				var n int
+				_ = conn.QueryRow(context.Background(), "SELECT 1").Scan(&n)
+				conn.Release()
+			}
+		})
+	})
+}
+
+// BenchmarkGetRun measures GET /runs/{id} — fetches a run from DB and resolves
+// all three S3 byte-range refs (inputs, outputs, metadata) back into a response.
+func BenchmarkGetRun(b *testing.B) {
+	r, _ := newTestRouter(b)
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+	client := &http.Client{}
+
+	cases := []struct {
+		name      string
+		fieldSize int
+	}{
+		{name: "100KB_fields", fieldSize: 100},
+		{name: "1000KB_fields", fieldSize: 1000},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		b.Run(tc.name, func(b *testing.B) {
+			// Seed one run to fetch — outside the timed loop.
+			body := makeRunsBody(1, tc.fieldSize)
+			resp, err := client.Post(ts.URL+"/runs", "application/json", bytes.NewReader(body))
+			if err != nil || resp.StatusCode != http.StatusCreated {
+				b.Fatalf("seed POST failed: status=%d err=%v", resp.StatusCode, err)
+			}
+			var created struct {
+				RunIDs []string `json:"run_ids"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&created)
+			resp.Body.Close()
+			if len(created.RunIDs) == 0 {
+				b.Fatal("no run_ids in POST response")
+			}
+			getURL := ts.URL + "/runs/" + created.RunIDs[0]
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				resp, err := client.Get(getURL)
+				if err != nil {
+					b.Fatalf("GET failed: %v", err)
+				}
+				if resp.StatusCode != http.StatusOK {
+					b.Fatalf("expected 200, got %d", resp.StatusCode)
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		})
+	}
 }
 
 func BenchmarkCreateRuns(b *testing.B) {
